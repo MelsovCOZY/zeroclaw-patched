@@ -13,7 +13,7 @@ permissions:
 env:
   ZEROCLAW_REF: v0.9.0
   # Bump when the patch set changes; the image tag is <ref>-<patchset>.
-  PATCHSET: pr12479
+  PATCHSET: pr12479-zt1
 
 jobs:
   image:

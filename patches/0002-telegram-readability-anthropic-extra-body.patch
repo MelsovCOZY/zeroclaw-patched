@@ -1,0 +1,447 @@
+diff --git a/crates/zeroclaw-channels/src/orchestrator/mod.rs b/crates/zeroclaw-channels/src/orchestrator/mod.rs
+index 84b749a..0f30f6c 100644
+--- a/crates/zeroclaw-channels/src/orchestrator/mod.rs
++++ b/crates/zeroclaw-channels/src/orchestrator/mod.rs
+@@ -183,7 +183,8 @@ struct ChannelNotifyObserver {
+     tools_used: AtomicBool,
+ }
+ 
+-const NOTIFY_DETAIL_MAX_CHARS: usize = 4096;
++// A path or URL longer than this is cut in the "🔧 tool: …" notification; it is a hint, not data.
++const NOTIFY_DETAIL_MAX_CHARS: usize = 200;
+ 
+ impl Observer for ChannelNotifyObserver {
+     fn record_event(&self, event: &ObserverEvent) {
+@@ -204,9 +205,12 @@ impl Observer for ChannelNotifyObserver {
+                         } else if let Some(q) = v.get("query").and_then(|c| c.as_str()) {
+                             format!(": {}", truncate_with_ellipsis(q, 200))
+                         } else if let Some(p) = v.get("path").and_then(|c| c.as_str()) {
+-                            format!(": {}", truncate_with_ellipsis(p, NOTIFY_DETAIL_MAX_CHARS))
++                            // Code span: Telegram does not auto-link it, so no preview card.
++                            format!(": `{}`", truncate_with_ellipsis(p, NOTIFY_DETAIL_MAX_CHARS))
+                         } else if let Some(u) = v.get("url").and_then(|c| c.as_str()) {
+-                            format!(": {}", truncate_with_ellipsis(u, NOTIFY_DETAIL_MAX_CHARS))
++                            format!(": `{}`", truncate_with_ellipsis(u, NOTIFY_DETAIL_MAX_CHARS))
++                        } else if v.as_object().is_some_and(|o| o.is_empty()) {
++                            String::new()
+                         } else {
+                             let s = args.to_string();
+                             format!(": {}", truncate_with_ellipsis(&s, 120))
+@@ -2153,14 +2157,13 @@ fn channel_delivery_instructions(channel_name: &str) -> Option<&'static str> {
+              - Use *italic* for emphasis (renders as <i>)\n\
+              - Use `backticks` for inline code, commands, or technical terms\n\
+              - Use triple backticks for code blocks\n\
+-             - Use emoji naturally to add personality — but don't overdo it\n\
+              - Be concise and direct. Skip filler phrases like 'Great question!' or 'Certainly!'\n\
+              - Structure longer answers with bold headers, not raw markdown ## headers\n\
+              - For media attachments use markers: [IMAGE:<path-or-url>], [DOCUMENT:<path-or-url>], [VIDEO:<path-or-url>], [AUDIO:<path-or-url>], or [VOICE:<path-or-url>]\n\
+              - Keep normal text outside markers and never wrap markers in code fences.\n\
+              - When a question needs current, real-time, or external information \
+                (prices, news, weather, web pages, lookups, etc.), use your tools — \
+-               e.g. web_search_tool and web_fetch — to obtain it before answering; \
++               such as web search and page reading — to obtain it before answering; \
+                never guess or answer from memory alone when a tool can verify it.\n\
+              - Present the final answer to the latest user message directly from the \
+                tool results, without narrating delayed/internal tool-execution bookkeeping.",
+@@ -14718,6 +14721,18 @@ pub(crate) fn build_configured_matrix_channel(
+         .with_ack_reactions(ack))
+ }
+ 
++/// Tools registered as Telegram slash commands. A bot with many tools (MCP servers included)
++/// overflows Telegram's command list, `setMyCommands` fails with BOT_COMMANDS_TOO_MUCH and the
++/// menu keeps stale entries, so tool commands are off unless
++/// `ZEROCLAW_TELEGRAM_TOOL_COMMANDS=1`. The built-in commands and skills are always registered.
++fn telegram_tool_command_specs(tool_specs: &[(String, String)]) -> Vec<(String, String)> {
++    if std::env::var("ZEROCLAW_TELEGRAM_TOOL_COMMANDS").is_ok_and(|v| v == "1") {
++        tool_specs.to_vec()
++    } else {
++        Vec::new()
++    }
++}
++
+ fn collect_configured_channels(
+     config_arc: &zeroclaw_config::live::LiveConfigHandle,
+     matrix_skip_context: &str,
+@@ -14822,7 +14837,7 @@ fn collect_configured_channels_with_authority(
+                     .with_tts(&config)
+                     .with_workspace_dir(config.channel_workspace_dir(&format!("telegram.{alias}")))
+                     .with_proxy_url(tg.proxy_url.clone())
+-                    .with_tool_command_specs(tool_specs.to_vec())
++                    .with_tool_command_specs(telegram_tool_command_specs(tool_specs))
+                     .with_per_user_session(tg.per_user_session)
+                     .with_approval_timeout_secs(tg.approval_timeout_secs),
+                 ),
+@@ -39445,8 +39460,9 @@ BTC is currently around $65,000 based on latest tool output."#
+         let emitted = rx.try_recv().expect("observer should emit notify message");
+         // The full input was 64 KiB; the emitted message must be capped
+         // to NOTIFY_DETAIL_MAX_CHARS + the literal prefix/suffix chars
+-        // ("\u{1F527} `file_read`: " = 17 chars + "…" = 1 char).
+-        let max_len = NOTIFY_DETAIL_MAX_CHARS + 17 + 1;
++        // ("\u{1F527} `file_read`: " = 17 chars + "…" = 1 char + the 2 backticks
++        // of the code span the path is wrapped in).
++        let max_len = NOTIFY_DETAIL_MAX_CHARS + 17 + 1 + 2;
+         assert!(
+             emitted.chars().count() <= max_len,
+             "emitted notify message must be capped (got {} chars, max {})",
+diff --git a/crates/zeroclaw-channels/src/telegram.rs b/crates/zeroclaw-channels/src/telegram.rs
+index a4aec80..cafa543 100644
+--- a/crates/zeroclaw-channels/src/telegram.rs
++++ b/crates/zeroclaw-channels/src/telegram.rs
+@@ -2454,6 +2454,7 @@ impl TelegramChannel {
+             .post(self.api_url("editMessageText"))
+             .json(&serde_json::json!({
+                 "chat_id": chat_id,
++                "link_preview_options": { "is_disabled": true },
+                 "message_id": message_id,
+                 "text": text,
+                 "reply_markup": reply_markup,
+@@ -6187,19 +6188,44 @@ Allowlist Telegram username (without '@') or numeric user ID.",
+     /// Telegram HTML supports: <b>, <i>, <u>, <s>, <code>, <pre>, <a href="...">
+     /// This mirrors OpenClaw's markdownToTelegramHtml approach.
+     fn markdown_to_telegram_html(text: &str) -> String {
++        // Marks a line that came from a Markdown blockquote (`> text`); the second pass
++        // groups consecutive marked lines into one <blockquote>.
++        const QUOTE_MARK: char = '\u{1}';
+         let lines: Vec<&str> = text.split('\n').collect();
+         let mut result_lines: Vec<String> = Vec::new();
++        let mut in_fence = false;
+ 
+-        for line in &lines {
+-            let trimmed_line = line.trim_start();
++        for raw_line in &lines {
++            let trimmed_line = raw_line.trim_start();
+             if trimmed_line.starts_with("```") {
+                 // Preserve fence lines so the second-pass block parser can consume them
+                 // without interference from inline backtick handling.
++                in_fence = !in_fence;
+                 result_lines.push(trimmed_line.to_string());
+                 continue;
+             }
+ 
+-            let mut line_out = String::new();
++            // Outside code blocks: `> quote` becomes a Telegram blockquote and a `- ` / `* `
++            // list marker becomes a bullet, since Telegram HTML has no list tags.
++            let mut quoted = false;
++            let mut unquoted: &str = raw_line;
++            let mut bullet_line: Option<String> = None;
++            if !in_fence {
++                if let Some(rest) = trimmed_line.strip_prefix('>') {
++                    quoted = true;
++                    unquoted = rest.strip_prefix(' ').unwrap_or(rest);
++                }
++                let body = unquoted.trim_start();
++                let indent = &unquoted[..unquoted.len() - body.len()];
++                if let Some(item) = body.strip_prefix("- ").or_else(|| body.strip_prefix("* ")) {
++                    bullet_line = Some(format!("{indent}• {item}"));
++                }
++            }
++            let line: &str = bullet_line.as_deref().unwrap_or(unquoted);
++            let line = &line;
++            let quote_prefix = if quoted { QUOTE_MARK.to_string() } else { String::new() };
++
++            let mut line_out = quote_prefix.clone();
+ 
+             // Handle code blocks (``` ... ```) - handled at text level below
+             // Handle headers: ## Title → <b>Title</b>
+@@ -6207,7 +6233,7 @@ Allowlist Telegram username (without '@') or numeric user ID.",
+             let header_level = line.len() - stripped.len();
+             if header_level > 0 && line.starts_with('#') && stripped.starts_with(' ') {
+                 let title = Self::escape_html(stripped.trim());
+-                result_lines.push(format!("<b>{title}</b>"));
++                result_lines.push(format!("{quote_prefix}<b>{title}</b>"));
+                 continue;
+             }
+ 
+@@ -6311,8 +6337,19 @@ Allowlist Telegram username (without '@') or numeric user ID.",
+         let mut final_out = String::with_capacity(joined.len());
+         let mut in_code_block = false;
+         let mut code_buf = String::new();
++        let mut quote_buf: Vec<&str> = Vec::new();
+ 
+         for line in joined.split('\n') {
++            if !in_code_block {
++                if let Some(quoted) = line.strip_prefix(QUOTE_MARK) {
++                    quote_buf.push(quoted);
++                    continue;
++                }
++                if !quote_buf.is_empty() {
++                    let _ = writeln!(final_out, "<blockquote>{}</blockquote>", quote_buf.join("\n"));
++                    quote_buf.clear();
++                }
++            }
+             let trimmed = line.trim();
+             if trimmed.starts_with("```") {
+                 if in_code_block {
+@@ -6336,6 +6373,9 @@ Allowlist Telegram username (without '@') or numeric user ID.",
+         if in_code_block && !code_buf.is_empty() {
+             let _ = writeln!(final_out, "<pre><code>{}</code></pre>", code_buf.trim_end());
+         }
++        if !quote_buf.is_empty() {
++            let _ = writeln!(final_out, "<blockquote>{}</blockquote>", quote_buf.join("\n"));
++        }
+ 
+         final_out.trim_end_matches('\n').to_string()
+     }
+@@ -6371,6 +6411,7 @@ Allowlist Telegram username (without '@') or numeric user ID.",
+ 
+             let mut markdown_body = serde_json::json!({
+                 "chat_id": chat_id,
++                "link_preview_options": { "is_disabled": true },
+                 "text": Self::markdown_to_telegram_html(&text),
+                 "parse_mode": "HTML"
+             });
+@@ -6415,6 +6456,7 @@ Allowlist Telegram username (without '@') or numeric user ID.",
+ 
+             let mut plain_body = serde_json::json!({
+                 "chat_id": chat_id,
++                "link_preview_options": { "is_disabled": true },
+                 "text": text,
+             });
+ 
+@@ -7317,6 +7359,7 @@ Allowlist Telegram username (without '@') or numeric user ID.",
+                 // valid markup object (inline_keyboard is a required field)
+                 let edit_body = serde_json::json!({
+                     "chat_id": chat_id,
++                    "link_preview_options": { "is_disabled": true },
+                     "message_id": message_id,
+                     "text": format!("{} by {}: {}", answer_text, user_first_name, tool_name),
+                     "reply_markup": { "inline_keyboard": [] },
+@@ -7915,6 +7958,7 @@ impl Channel for TelegramChannel {
+         );
+         let mut body = serde_json::json!({
+             "chat_id": chat_id,
++            "link_preview_options": { "is_disabled": true },
+             "text": picker_text,
+         });
+         if let Some(thread_id) = thread_id {
+@@ -8023,6 +8067,7 @@ impl Channel for TelegramChannel {
+ 
+                 let mut body = serde_json::json!({
+                     "chat_id": chat_id,
++                    "link_preview_options": { "is_disabled": true },
+                     "text": initial_text,
+                 });
+                 if let Some(tid) = thread_id {
+@@ -8122,6 +8167,7 @@ impl Channel for TelegramChannel {
+ 
+                 let body = serde_json::json!({
+                     "chat_id": chat_id,
++                    "link_preview_options": { "is_disabled": true },
+                     "message_id": message_id_parsed,
+                     "text": display_text,
+                 });
+@@ -8356,6 +8402,7 @@ impl Channel for TelegramChannel {
+         // Try editing with HTML formatting
+         let body = serde_json::json!({
+             "chat_id": chat_id,
++            "link_preview_options": { "is_disabled": true },
+             "message_id": id,
+             "text": Self::markdown_to_telegram_html(text),
+             "parse_mode": "HTML",
+@@ -8383,6 +8430,7 @@ impl Channel for TelegramChannel {
+         // HTML failed — retry without parse_mode
+         let plain_body = serde_json::json!({
+             "chat_id": chat_id,
++            "link_preview_options": { "is_disabled": true },
+             "message_id": id,
+             "text": text,
+         });
+@@ -9086,6 +9134,7 @@ impl TelegramChannel {
+ 
+         let mut body = serde_json::json!({
+             "chat_id": chat_id,
++            "link_preview_options": { "is_disabled": true },
+             "text": text,
+             "parse_mode": "HTML",
+             "reply_markup": reply_markup,
+@@ -9144,6 +9193,7 @@ impl TelegramChannel {
+                     );
+                     let mut plain_body = serde_json::json!({
+                         "chat_id": chat_id,
++                        "link_preview_options": { "is_disabled": true },
+                         "text": plain_text,
+                         "reply_markup": reply_markup,
+                     });
+@@ -13345,6 +13395,19 @@ mod tests {
+         assert!(!rendered.contains("onclick"));
+     }
+ 
++    #[test]
++    fn telegram_markdown_to_html_renders_blockquotes_and_bullets() {
++        let rendered = TelegramChannel::markdown_to_telegram_html(
++            "Итог:\n> first **line**\n> second\n- item a\n* item b\n```\n> kept\n- kept\n```",
++        );
++        assert_eq!(
++            rendered,
++            "Итог:\n<blockquote>first <b>line</b>\nsecond</blockquote>\n• item a\n• item b\n<pre><code>&gt; kept\n- kept</code></pre>"
++        );
++        let tail = TelegramChannel::markdown_to_telegram_html("a\n> quoted at end");
++        assert_eq!(tail, "a\n<blockquote>quoted at end</blockquote>");
++    }
++
+     #[test]
+     fn telegram_user_allowed_wildcard() {
+         let mention_only = false;
+diff --git a/crates/zeroclaw-providers/src/anthropic.rs b/crates/zeroclaw-providers/src/anthropic.rs
+index ccc89b2..ed91b88 100644
+--- a/crates/zeroclaw-providers/src/anthropic.rs
++++ b/crates/zeroclaw-providers/src/anthropic.rs
+@@ -109,6 +109,11 @@ pub struct AnthropicModelProvider {
+     /// paths that rebuild the provider per call (e.g. the per-iteration
+     /// vision route) start it empty each time.
+     schema_cache: zeroclaw_api::schema::SchemaCleanCache,
++    /// Operator-supplied request-body keys (`provider_extra`), merged into
++    /// every Messages request without overriding a key the request already
++    /// sets. Lets config reach API fields this provider does not model yet,
++    /// e.g. `provider_extra = { output_config = { effort = "high" } }`.
++    extra_body: Option<serde_json::Map<String, serde_json::Value>>,
+     /// Test-only override of [`AnthropicModelProvider::sends_block_binding`],
+     /// so tests can exercise the field against a local mock endpoint.
+     #[cfg(test)]
+@@ -771,6 +776,7 @@ pub struct AnthropicBuilder {
+     timeout_secs: Option<u64>,
+     server_fallback_models: Vec<String>,
+     cache_ttl: Option<CacheTtl>,
++    extra_body: Option<serde_json::Map<String, serde_json::Value>>,
+     #[cfg(test)]
+     thinking_block_binding: Option<bool>,
+ }
+@@ -828,6 +834,16 @@ impl AnthropicBuilder {
+         self
+     }
+ 
++    /// Extra request-body keys from `provider_extra`. Only an object is
++    /// used; any other shape is ignored.
++    pub fn extra_body(mut self, extra: Option<&serde_json::Value>) -> Self {
++        self.extra_body = extra
++            .and_then(serde_json::Value::as_object)
++            .filter(|o| !o.is_empty())
++            .cloned();
++        self
++    }
++
+     /// Force the `thinking.block_binding` decision, so tests can exercise the
+     /// field against a local mock endpoint.
+     #[cfg(test)]
+@@ -851,12 +867,32 @@ impl AnthropicBuilder {
+             server_fallback_models: self.server_fallback_models,
+             cache_ttl: self.cache_ttl.unwrap_or_default(),
+             schema_cache: zeroclaw_api::schema::SchemaCleanCache::new(),
++            extra_body: self.extra_body,
+             #[cfg(test)]
+             block_binding_override: self.thinking_block_binding,
+         }
+     }
+ }
+ 
++/// Insert every key of `extra` that `body` lacks, recursing into objects
++/// present in both. Keys the request already sets always win, so config can
++/// add fields but never change what the provider computed.
++fn merge_missing(body: &mut serde_json::Map<String, serde_json::Value>, extra: &serde_json::Map<String, serde_json::Value>) {
++    for (key, value) in extra {
++        match body.get_mut(key) {
++            None => {
++                body.insert(key.clone(), value.clone());
++            }
++            Some(serde_json::Value::Object(existing)) => {
++                if let serde_json::Value::Object(extra_obj) = value {
++                    merge_missing(existing, extra_obj);
++                }
++            }
++            Some(_) => {}
++        }
++    }
++}
++
+ impl AnthropicModelProvider {
+     /// Entry point. Only `alias` is required; every other field is set
+     /// via a labelled chain method on the returned [`AnthropicBuilder`].
+@@ -870,11 +906,25 @@ impl AnthropicModelProvider {
+             timeout_secs: None,
+             server_fallback_models: Vec::new(),
+             cache_ttl: None,
++            extra_body: None,
+             #[cfg(test)]
+             thinking_block_binding: None,
+         }
+     }
+ 
++    /// Serialize a request body and merge the configured extra keys into it.
++    fn body_with_extra<T: serde::Serialize>(&self, request: &T) -> anyhow::Result<serde_json::Value> {
++        let mut body = serde_json::to_value(request).context("Failed to serialize Anthropic request")?;
++        self.apply_extra_body(&mut body);
++        Ok(body)
++    }
++
++    fn apply_extra_body(&self, body: &mut serde_json::Value) {
++        if let (Some(extra), Some(obj)) = (self.extra_body.as_ref(), body.as_object_mut()) {
++            merge_missing(obj, extra);
++        }
++    }
++
+     fn is_setup_token(token: &str) -> bool {
+         token.starts_with("sk-ant-oat01-")
+     }
+@@ -3128,6 +3178,7 @@ impl ModelProvider for AnthropicModelProvider {
+             thinking: None,
+             fallbacks,
+         };
++        let request = self.body_with_extra(&request)?;
+ 
+         let mut request = self
+             .http_client()
+@@ -3289,13 +3340,14 @@ impl ModelProvider for AnthropicModelProvider {
+             thinking: thinking_config,
+             fallbacks,
+         };
++        let request_body = self.body_with_extra(&native_request)?;
+ 
+         let req = self
+             .http_client()
+             .post(format!("{}/v1/messages", self.base_url))
+             .header("anthropic-version", "2023-06-01")
+             .header("content-type", "application/json")
+-            .json(&native_request);
++            .json(&request_body);
+ 
+         let response = self
+             .apply_auth(req, credential, thinking_display_beta, &extra_betas)
+@@ -3534,8 +3586,9 @@ impl ModelProvider for AnthropicModelProvider {
+             };
+             // Serialize eagerly so the request body is owned and `'static`
+             // across the async boundary.
+-            let body = serde_json::to_value(&native_request)
++            let mut body = serde_json::to_value(&native_request)
+                 .expect("NativeChatRequest should serialize to JSON");
++            self.apply_extra_body(&mut body);
+             let client = self.http_client();
+             let url = format!("{}/v1/messages", self.base_url);
+             let is_oauth = Self::is_setup_token(&credential);
+@@ -3665,13 +3718,14 @@ impl ModelProvider for AnthropicModelProvider {
+             fallbacks: None,
+         };
+ 
+-        let body = match Self::build_streaming_request(&native_request) {
++        let mut body = match Self::build_streaming_request(&native_request) {
+             Ok(body) => body,
+             Err(e) => {
+                 return stream::once(async move { Err(StreamError::ModelProvider(e.to_string())) })
+                     .boxed();
+             }
+         };
++        self.apply_extra_body(&mut body);
+         let client = match self.streaming_http_client() {
+             Ok(client) => client,
+             Err(error) => {
+diff --git a/crates/zeroclaw-providers/src/factory.rs b/crates/zeroclaw-providers/src/factory.rs
+index 4633814..246e7fa 100644
+--- a/crates/zeroclaw-providers/src/factory.rs
++++ b/crates/zeroclaw-providers/src/factory.rs
+@@ -1236,6 +1236,7 @@ impl FamilyProviderFactory for AnthropicModelProviderConfig {
+         if let Some(cache_ttl) = opts.cache_ttl {
+             b = b.cache_ttl(cache_ttl);
+         }
++        b = b.extra_body(opts.provider_extra.as_ref());
+         Ok(Box::new(b.build()))
+     }
+ }
